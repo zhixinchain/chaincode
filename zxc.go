@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"time"
+        "unicode/utf8"
 
 	"github.com/hyperledger/fabric/core/chaincode/shim"
 	pb "github.com/hyperledger/fabric/protos/peer"
@@ -20,6 +21,7 @@ type Transaction struct{
 	Type         string  `json:"type"`    //in--标示转入,out-标示转出
 	Amount       int64   `json:"amount"`  //交易的总金额
 	Time         string  `json:"time"`    //交易时间
+	Notes        string  `json:"notes"`   //交易备注
 }
 
 type Token struct{
@@ -42,8 +44,15 @@ func getDefaultToken() Token{
 	return token
 }
 
-func getTime () string {
-	return time.Now().Format("2006-01-02 15:04:05")
+func getTime (stub shim.ChaincodeStubInterface) string {
+	var txTime time.Time
+	timestamp, errTime:= stub.GetTxTimestamp()
+	if errTime != nil {
+		txTime = time.Now()
+	} else {
+		txTime = time.Unix(timestamp.GetSeconds(), 0)
+	}
+	return txTime.Format("2006-01-02 15:04:05")
 }
 
 func (t *TokenChaincode) Init(stub shim.ChaincodeStubInterface) pb.Response {
@@ -60,20 +69,20 @@ func (t *TokenChaincode) Init(stub shim.ChaincodeStubInterface) pb.Response {
 	initialToken.TxInfo.Address = "coin chaincode init"
 	initialToken.TxInfo.Type = "in"
 	initialToken.TxInfo.Amount = initialSupply
-	initialToken.TxInfo.Time = getTime()
+	initialToken.TxInfo.Time = getTime(stub)
 
  	initialTokenBytes, err = json.Marshal(initialToken)
 	if err != nil {
-		return shim.Error("init initial token json marshal err")
+		return shim.Error("[100100,\"init token json marshal err\"]")
 	}
 
 	if initialTokenBytes == nil {
-		return shim.Error("init initial token json marshal err")
+		return shim.Error("[100100,\"init token json marshal err\"]")
 	}
 
 	err = stub.PutState(owner, initialTokenBytes)
 	if err != nil {
-		return shim.Error(err.Error())
+		return shim.Error("[100101,\"init token write blockchain err:"+err.Error()+"\"]")
 	}
 
 	return shim.Success(nil)
@@ -92,7 +101,7 @@ func (t *TokenChaincode) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
 		return t.getHistory(stub, args)
 	}
 
-	return shim.Error("Invalid invoke function name. Expecting \"invoke\" \"delete\" \"query\"")
+	return shim.Error("[100001,Invalid invoke function name. Expecting \"invoke\" \"query\" \"getHistory\"]")
 }
 
 // Transaction makes payment of X units from A to B
@@ -100,9 +109,10 @@ func (t *TokenChaincode) invoke(stub shim.ChaincodeStubInterface, args []string)
 	var X int64          // Transaction value
 	var err error
 	var Avalbytes, Bvalbytes []byte
+	var nowTime string
 
-	if len(args) != 3 {
-		return shim.Error("Incorrect number of arguments. Expecting 3")
+	if len(args) != 4 {
+		return shim.Error("[100201,\"Incorrect number of arguments. Expecting 4\"]")
 	}
 
 	APrivateHash := args[0] //todo private to address
@@ -116,10 +126,10 @@ func (t *TokenChaincode) invoke(stub shim.ChaincodeStubInterface, args []string)
 	// TODO: will be nice to have a GetAllState call to ledger
 	Avalbytes, err = stub.GetState(AAddressHash)
 	if err != nil {
-		return shim.Error("Failed to get account state")
+		return shim.Error("[100202,\"Failed to get account state\"]")
 	}
 	if Avalbytes == nil {
-		return shim.Error("Acount entity not found")
+		return shim.Error("[100203,\"Failed to get account state\"]")
 	}
 
 	Atoken := Token{}
@@ -129,7 +139,7 @@ func (t *TokenChaincode) invoke(stub shim.ChaincodeStubInterface, args []string)
 
 	Bvalbytes, err = stub.GetState(BAddressHash)
 	if err != nil {
-		return shim.Error("Failed to get account state")
+		return shim.Error("[100204,\"Failed to get counterparty account state\"]")
 	}
 	//返回nill说明账户不存在
 	if Bvalbytes == nil {
@@ -142,36 +152,42 @@ func (t *TokenChaincode) invoke(stub shim.ChaincodeStubInterface, args []string)
 	// Perform the execution
 	X, err = strconv.ParseInt(args[2], 10, 64)
 	if err != nil {
-		return shim.Error("Invalid transaction amount, expecting a integer value")
+		return shim.Error("[100205,\"Invalid transaction amount, expecting a integer value\"]")
 	}
 
 	if Atoken.Amount <=0 {
-		return shim.Error("The balance is empty")
+		return shim.Error("[100206,\"The balance is empty\"]")
 	}
 
 	if Atoken.Amount < X {
-		return shim.Error("Lack of balance")
+		return shim.Error("[100207,\"Lack of balance\"]")
 	}
 
 	if X < 0 {
-		return shim.Error("Transfer amount cannot be negative")
+		return shim.Error("[100208,\"Transfer amount cannot be negative\"]")
 	}
 
 	if Atoken.Amount - X > Atoken.Amount {
-		return shim.Error("Transfer amount err")
+		return shim.Error("[100209,\"Transfer amount err\"]")
 	}
 
 	if Btoken.Amount + X < Btoken.Amount {
-		return shim.Error("Transfer amount err")
+		return shim.Error("[100210,\"Transfer amount err\"]")
 	}
 
-	nowTime := getTime()
+	notes := args[3]
+	if utf8.RuneCountInString(notes) > 100 {
+		return shim.Error("[100211,\"Transfer notes length too big\"]")
+	}
+
+	nowTime = getTime(stub)
 
 	Atoken.Amount -= X
 	Atoken.TxInfo.Address = BAddressHash
 	Atoken.TxInfo.Amount = X
 	Atoken.TxInfo.Type = "out"
 	Atoken.TxInfo.Time = nowTime
+	Atoken.TxInfo.Notes = notes
 
 
 	Btoken.Amount += X
@@ -179,6 +195,7 @@ func (t *TokenChaincode) invoke(stub shim.ChaincodeStubInterface, args []string)
 	Btoken.TxInfo.Amount = X
 	Btoken.TxInfo.Type = "in"
 	Btoken.TxInfo.Time = nowTime
+	Btoken.TxInfo.Notes = notes
 
 	fmt.Printf("Atoken.amount = %f, Btoken.amount = %f\n", Atoken.Amount, Btoken.Amount)
 
@@ -186,13 +203,13 @@ func (t *TokenChaincode) invoke(stub shim.ChaincodeStubInterface, args []string)
 	AtokenBytes, _ := json.Marshal(Atoken)
 	err = stub.PutState(AAddressHash, AtokenBytes)
 	if err != nil {
-		return shim.Error(err.Error())
+		return shim.Error("[100212,\"Your Account write back to chaincode err\"]")
 	}
 
 	BtokenBytes, _ := json.Marshal(Btoken)
 	err = stub.PutState(BAddressHash, BtokenBytes)
 	if err != nil {
-		return shim.Error(err.Error())
+		return shim.Error("[100212,\"Counterparty Account write back to chaincode err\"]")
 	}
 
 	return shim.Success(nil)
@@ -204,7 +221,7 @@ func (t *TokenChaincode) query(stub shim.ChaincodeStubInterface, args []string) 
 	var err error
 
 	if len(args) != 1 {
-		return shim.Error("Incorrect number of arguments. Expecting name of the person to query")
+		return shim.Error("[100301,\"Incorrect number of arguments. Expecting address of the account to query\"]")
 	}
 
 	A = args[0]
@@ -212,8 +229,7 @@ func (t *TokenChaincode) query(stub shim.ChaincodeStubInterface, args []string) 
 	// Get the state from the ledger
 	Avalbytes, err := stub.GetState(A)
 	if err != nil {
-		jsonResp := "{\"Error\":\"Failed to get state for " + A + "\"}"
-		return shim.Error(jsonResp)
+		return shim.Error("[100302,\"Failed get account of your address\"]")
 	}
 
 
@@ -237,7 +253,7 @@ func (t *TokenChaincode) getHistory(stub shim.ChaincodeStubInterface, args []str
 	var token Token
 
 	if len(args) != 1 {
-		return shim.Error("Incorrect number of arguments. Expecting 1")
+		return shim.Error("[100401,\"Incorrect number of arguments. Expecting 1\"]")
 	}
 
 	tokenAddress := args[0]
@@ -246,14 +262,14 @@ func (t *TokenChaincode) getHistory(stub shim.ChaincodeStubInterface, args []str
 	// Get History
 	resultsIterator, err := stub.GetHistoryForKey(tokenAddress)
 	if err != nil {
-		return shim.Error(err.Error())
+		return shim.Error("[100402,\"Get account history err\"]")
 	}
 	defer resultsIterator.Close()
 
 	for resultsIterator.HasNext() {
 		historyData, err := resultsIterator.Next()
 		if err != nil {
-			return shim.Error(err.Error())
+			return shim.Error("[100403,\"Iterator history info err\"]")
 		}
 
 		var tx TokenHistory
