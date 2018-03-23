@@ -14,7 +14,7 @@ import (
 
 const initialSupply = 500000000000000000
 const tokenUnit      = "gas"
-const owner = "1Ge2Q89tkZZLrWvNtLBaERBRdTDNXWQwhF"
+const owner = "1Pv62LXtTzg6dy4cmtNkc9NWNcbALtq6zq"
 
 type Transaction struct{
 	Address      string  `json:"address"` //交易对方账户地址
@@ -26,6 +26,7 @@ type Transaction struct{
 
 type Token struct{
 	IsFrozen bool       `json:"isFrozen"`   //账号是否被冻结
+	IsMulti  bool       `json:"isMulti"`    //是否多重签名账户
 	Amount   int64      `json:"amount"`     //账户金额
 	Unit     string     `json:"unit"`       //单位
 	TxInfo Transaction  `json:"txInfo"`     //本次交易信息
@@ -38,6 +39,7 @@ type TokenChaincode struct {
 func getDefaultToken() Token{
 	token := Token{}
 	token.IsFrozen = false
+	token.IsMulti  = false
 	token.Amount = 0
 	token.Unit = tokenUnit
 	token.TxInfo = Transaction{}
@@ -52,7 +54,8 @@ func getTime (stub shim.ChaincodeStubInterface) string {
 	} else {
 		txTime = time.Unix(timestamp.GetSeconds(), 0)
 	}
-	return txTime.Format("2006-01-02 15:04:05")
+	loc, _:= time.LoadLocation("Asia/Shanghai")
+	return txTime.In(loc).Format("2006-01-02 15:04:05")
 }
 
 func (t *TokenChaincode) Init(stub shim.ChaincodeStubInterface) pb.Response {
@@ -80,6 +83,11 @@ func (t *TokenChaincode) Init(stub shim.ChaincodeStubInterface) pb.Response {
 		return shim.Error("[100100,\"init token json marshal err\"]")
 	}
 
+
+	if wallet.CheckAddresss(owner) == false {
+		return shim.Error("[100100,\"init token address err\"]")
+	}
+
 	err = stub.PutState(owner, initialTokenBytes)
 	if err != nil {
 		return shim.Error("[100101,\"init token write blockchain err:"+err.Error()+"\"]")
@@ -99,9 +107,11 @@ func (t *TokenChaincode) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
 		return t.query(stub, args)
 	} else if function == "getHistory" {
 		return t.getHistory(stub, args)
+	} else if function == "frozenAccount" {
+		return t.frozenAccount(stub, args)
 	}
 
-	return shim.Error("[100001,Invalid invoke function name. Expecting \"invoke\" \"query\" \"getHistory\"]")
+	return shim.Error("[100001,Invalid invoke function name:"+function+". Expecting \"invoke\" \"query\" \"getHistory\"]")
 }
 
 // Transaction makes payment of X units from A to B
@@ -122,6 +132,15 @@ func (t *TokenChaincode) invoke(stub shim.ChaincodeStubInterface, args []string)
 	BAddressHash := args[1]
 
 
+	if AAddressHash == BAddressHash{
+		return shim.Error("[100201,\"Invalid arguments. Cannot transfer to oneself.\"]")
+	}
+
+	if wallet.CheckAddresss(BAddressHash) == false {
+		return shim.Error("[100201,\"Invalid arguments. Cannot transfer to invalid address.\"]")
+	}
+
+
 	// Get the state from the ledger
 	// TODO: will be nice to have a GetAllState call to ledger
 	Avalbytes, err = stub.GetState(AAddressHash)
@@ -136,6 +155,11 @@ func (t *TokenChaincode) invoke(stub shim.ChaincodeStubInterface, args []string)
 	Btoken := Token{}
 
 	json.Unmarshal(Avalbytes, &Atoken)
+
+	if Atoken.IsFrozen == true {
+		return shim.Error("[100203,\"The frozen account cannot be used for transfer.\"]")
+	}
+
 
 	Bvalbytes, err = stub.GetState(BAddressHash)
 	if err != nil {
@@ -226,6 +250,11 @@ func (t *TokenChaincode) query(stub shim.ChaincodeStubInterface, args []string) 
 
 	A = args[0]
 
+	if wallet.CheckAddresss(A) == false {
+		return shim.Error("[100301,\"Invalid address arguments.\"]")
+	}
+
+
 	// Get the state from the ledger
 	Avalbytes, err := stub.GetState(A)
 	if err != nil {
@@ -259,6 +288,10 @@ func (t *TokenChaincode) getHistory(stub shim.ChaincodeStubInterface, args []str
 	tokenAddress := args[0]
 	fmt.Printf("- start getHistoryForToken: %s\n", tokenAddress)
 
+	if wallet.CheckAddresss(tokenAddress) == false {
+		return shim.Error("[100401,\"Invalid address arguments.\"]")
+	}
+
 	// Get History
 	resultsIterator, err := stub.GetHistoryForKey(tokenAddress)
 	if err != nil {
@@ -290,6 +323,60 @@ func (t *TokenChaincode) getHistory(stub shim.ChaincodeStubInterface, args []str
 	historyAsBytes, _ := json.Marshal(history)     //convert to array of bytes
 	return shim.Success(historyAsBytes)
 }
+
+func (t *TokenChaincode) frozenAccount(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	var bToken Token
+	if len(args) != 4 {
+		return shim.Error("[100501,\"Incorrect number of arguments. Expecting 4\"]")
+	}
+
+	privateHash := args[0]
+	AWallet := wallet.SetWallet(privateHash)
+	ownerAddress :=AWallet.GetAddress()
+
+	if owner != ownerAddress {
+		return shim.Error("[100501,\"Only the management account can perform the freezing function.\"]")
+	}
+
+	bAddress := args[1];
+	if wallet.CheckAddresss(bAddress) == false {
+		return shim.Error("[100501,\"Invalid counterparty address arguments.\"]")
+	}
+
+	isFrozen, err := strconv.ParseBool(args[2])
+	if err != nil {
+		return shim.Error("[100501,\"Failed get frozen param\"]")
+	}
+
+	notes    := args[3]
+
+	bValbytes, err := stub.GetState(bAddress)
+	if err != nil {
+		return shim.Error("[100502,\"Failed get account of counterparty address\"]")
+	}
+
+
+	if bValbytes == nil {
+		bToken =getDefaultToken()
+	} else {
+		json.Unmarshal(bValbytes, &bToken)
+	}
+	bToken.IsFrozen = isFrozen
+        bToken.TxInfo.Address = "Administrator"; 
+        bToken.TxInfo.Type = "frozen operation"; 
+        bToken.TxInfo.Amount = 0; 
+        bToken.TxInfo.Time  = getTime(stub); 
+        bToken.TxInfo.Notes = notes; 
+
+	bTokenBytes, _ := json.Marshal(bToken)
+	err = stub.PutState(bAddress, bTokenBytes)
+	if err != nil {
+		return shim.Error("[100503,\"Counterparty Account write back to chaincode err\"]")
+	}
+
+	return shim.Success(nil)
+}
+
 
 func main() {
 	err := shim.Start(new(TokenChaincode))
